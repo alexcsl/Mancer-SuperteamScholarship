@@ -16,13 +16,12 @@ use solana_program::{
 use crate::{
     error::CrowdfundError,
     instruction::CrowdfundInstruction,
-    state::{Campaign, ContributionRecord},
+    state::{Campaign, ContributionRecord, CAMPAIGN_SIZE, CONTRIBUTION_SIZE},
 };
 
 pub struct Processor;
 
 impl Processor {
-    // route the instruction to the correct handler
     pub fn process(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
@@ -41,7 +40,6 @@ impl Processor {
         }
     }
 
-    // create a new campaign and its vault PDA
     // accounts: [creator, campaign_account, vault_pda, system_program]
     fn process_create_campaign(
         program_id: &Pubkey,
@@ -55,23 +53,28 @@ impl Processor {
         let vault_pda = next_account_info(accounts_iter)?;
         let system_program_account = next_account_info(accounts_iter)?;
 
-        // creator must sign the transaction
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
-        // goal must be nonzero
+        if system_program_account.key != &system_program::ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         if goal == 0 {
             return Err(ProgramError::InvalidArgument);
         }
 
-        // deadline must be in the future
         let clock = Clock::get()?;
         if deadline <= clock.unix_timestamp {
             return Err(CrowdfundError::DeadlineHasPassed.into());
         }
 
-        // derive vault PDA and verify the account passed in matches
+        // block reinitialization
+        if campaign_account.lamports() != 0 || !campaign_account.data_is_empty() {
+            return Err(ProgramError::AccountAlreadyInitialized);
+        }
+
         let (vault_key, vault_bump) = Pubkey::find_program_address(
             &[b"vault", campaign_account.key.as_ref()],
             program_id,
@@ -82,15 +85,12 @@ impl Processor {
 
         let rent = Rent::get()?;
 
-        // create the campaign account with space for 58 bytes, owned by this program
-        let campaign_space: u64 = 58;
-        let campaign_lamports = rent.minimum_balance(campaign_space as usize);
         invoke(
             &system_instruction::create_account(
                 creator.key,
                 campaign_account.key,
-                campaign_lamports,
-                campaign_space,
+                rent.minimum_balance(CAMPAIGN_SIZE),
+                CAMPAIGN_SIZE as u64,
                 program_id,
             ),
             &[
@@ -100,13 +100,11 @@ impl Processor {
             ],
         )?;
 
-        // create the vault PDA with zero data, owned by system program, to hold lamports
-        let vault_lamports = rent.minimum_balance(0);
         invoke_signed(
             &system_instruction::create_account(
                 creator.key,
                 vault_pda.key,
-                vault_lamports,
+                rent.minimum_balance(0),
                 0,
                 &system_program::ID,
             ),
@@ -118,7 +116,6 @@ impl Processor {
             &[&[b"vault", campaign_account.key.as_ref(), &[vault_bump]]],
         )?;
 
-        // write the initial campaign state to the campaign account
         let campaign = Campaign {
             creator: *creator.key,
             goal,
@@ -129,16 +126,11 @@ impl Processor {
         };
         campaign.serialize(&mut *campaign_account.try_borrow_mut_data()?)?;
 
-        solana_program::msg!(
-            "Campaign created: goal={}, deadline={}",
-            goal,
-            deadline
-        );
+        solana_program::msg!("Campaign created: goal={}, deadline={}", goal, deadline);
 
         Ok(())
     }
 
-    // accept a contribution from a donor and record it
     // accounts: [donor, campaign_account, vault_pda, contribution_pda, system_program]
     fn process_contribute(
         program_id: &Pubkey,
@@ -152,31 +144,29 @@ impl Processor {
         let contribution_pda = next_account_info(accounts_iter)?;
         let system_program_account = next_account_info(accounts_iter)?;
 
-        // donor must sign the transaction
         if !donor.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
-        // amount must be nonzero
+        if system_program_account.key != &system_program::ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         if amount == 0 {
             return Err(ProgramError::InvalidArgument);
         }
 
-        // campaign account must be owned by this program
         if campaign_account.owner != program_id {
             return Err(ProgramError::IllegalOwner);
         }
 
-        // read the current campaign state
         let mut campaign = Campaign::try_from_slice(&campaign_account.try_borrow_data()?)?;
 
-        // campaign must still be open
         let clock = Clock::get()?;
         if clock.unix_timestamp >= campaign.deadline {
             return Err(CrowdfundError::DeadlineHasPassed.into());
         }
 
-        // verify the vault PDA matches what is derived from the campaign account
         let (vault_key, _) = Pubkey::find_program_address(
             &[b"vault", campaign_account.key.as_ref()],
             program_id,
@@ -185,7 +175,6 @@ impl Processor {
             return Err(CrowdfundError::InvalidVaultPda.into());
         }
 
-        // derive the contribution PDA for this donor and this campaign
         let (contrib_key, contrib_bump) = Pubkey::find_program_address(
             &[
                 b"contribution",
@@ -200,17 +189,14 @@ impl Processor {
 
         let rent = Rent::get()?;
 
-        // check if the contribution PDA already exists for this donor
         if contribution_pda.lamports() == 0 {
-            // first contribution from this donor, create the account
-            let contrib_space: u64 = 40;
-            let contrib_lamports = rent.minimum_balance(contrib_space as usize);
+            // first contribution from this donor
             invoke_signed(
                 &system_instruction::create_account(
                     donor.key,
                     contribution_pda.key,
-                    contrib_lamports,
-                    contrib_space,
+                    rent.minimum_balance(CONTRIBUTION_SIZE),
+                    CONTRIBUTION_SIZE as u64,
                     program_id,
                 ),
                 &[
@@ -231,7 +217,7 @@ impl Processor {
             };
             record.serialize(&mut *contribution_pda.try_borrow_mut_data()?)?;
         } else {
-            // donor already contributed, add to the existing record
+            // add to existing record
             let mut record =
                 ContributionRecord::try_from_slice(&contribution_pda.try_borrow_data()?)?;
             if record.donor != *donor.key {
@@ -244,7 +230,6 @@ impl Processor {
             record.serialize(&mut *contribution_pda.try_borrow_mut_data()?)?;
         }
 
-        // transfer lamports from donor to vault
         invoke(
             &system_instruction::transfer(donor.key, vault_pda.key, amount),
             &[
@@ -254,23 +239,17 @@ impl Processor {
             ],
         )?;
 
-        // update the total raised on the campaign
         campaign.raised = campaign
             .raised
             .checked_add(amount)
             .ok_or(CrowdfundError::ArithmeticOverflow)?;
         campaign.serialize(&mut *campaign_account.try_borrow_mut_data()?)?;
 
-        solana_program::msg!(
-            "Contributed: {} lamports, total={}",
-            amount,
-            campaign.raised
-        );
+        solana_program::msg!("Contributed: {} lamports, total={}", amount, campaign.raised);
 
         Ok(())
     }
 
-    // creator withdraws all funds after a successful campaign
     // accounts: [creator, campaign_account, vault_pda, system_program]
     fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let accounts_iter = &mut accounts.iter();
@@ -279,41 +258,37 @@ impl Processor {
         let vault_pda = next_account_info(accounts_iter)?;
         let system_program_account = next_account_info(accounts_iter)?;
 
-        // creator must sign the transaction
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
-        // campaign account must be owned by this program
+        if system_program_account.key != &system_program::ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         if campaign_account.owner != program_id {
             return Err(ProgramError::IllegalOwner);
         }
 
-        // read the current campaign state
         let mut campaign = Campaign::try_from_slice(&campaign_account.try_borrow_data()?)?;
 
-        // only the original creator can withdraw
         if creator.key != &campaign.creator {
             return Err(CrowdfundError::NotCreator.into());
         }
 
-        // prevent double withdrawal
         if campaign.claimed {
             return Err(CrowdfundError::AlreadyClaimed.into());
         }
 
-        // deadline must have passed
         let clock = Clock::get()?;
         if clock.unix_timestamp < campaign.deadline {
             return Err(CrowdfundError::DeadlineNotReached.into());
         }
 
-        // goal must have been met
         if campaign.raised < campaign.goal {
             return Err(CrowdfundError::GoalNotReached.into());
         }
 
-        // verify the vault PDA using the stored bump seed
         let vault_key = Pubkey::create_program_address(
             &[
                 b"vault",
@@ -327,19 +302,16 @@ impl Processor {
             return Err(CrowdfundError::InvalidVaultPda.into());
         }
 
-        // compute how much to transfer, leaving the rent-exempt floor in the vault
         let rent = Rent::get()?;
-        let vault_rent_floor = rent.minimum_balance(0);
         let vault_balance = vault_pda.lamports();
         let withdraw_amount = vault_balance
-            .checked_sub(vault_rent_floor)
+            .checked_sub(rent.minimum_balance(0))
             .ok_or(ProgramError::InsufficientFunds)?;
 
         if withdraw_amount == 0 {
             return Err(ProgramError::InsufficientFunds);
         }
 
-        // transfer funds from vault to creator
         invoke_signed(
             &system_instruction::transfer(vault_pda.key, creator.key, withdraw_amount),
             &[
@@ -354,7 +326,6 @@ impl Processor {
             ]],
         )?;
 
-        // mark the campaign as claimed to prevent double withdrawal
         campaign.claimed = true;
         campaign.serialize(&mut *campaign_account.try_borrow_mut_data()?)?;
 
@@ -363,7 +334,6 @@ impl Processor {
         Ok(())
     }
 
-    // donor reclaims their contribution from a failed campaign
     // accounts: [donor, campaign_account, vault_pda, contribution_pda, system_program]
     fn process_refund(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
         let accounts_iter = &mut accounts.iter();
@@ -373,31 +343,29 @@ impl Processor {
         let contribution_pda = next_account_info(accounts_iter)?;
         let system_program_account = next_account_info(accounts_iter)?;
 
-        // donor must sign the transaction
         if !donor.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
-        // campaign account must be owned by this program
+        if system_program_account.key != &system_program::ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
         if campaign_account.owner != program_id {
             return Err(ProgramError::IllegalOwner);
         }
 
-        // read the current campaign state
         let mut campaign = Campaign::try_from_slice(&campaign_account.try_borrow_data()?)?;
 
-        // deadline must have passed before refunds are allowed
         let clock = Clock::get()?;
         if clock.unix_timestamp < campaign.deadline {
             return Err(CrowdfundError::DeadlineNotReached.into());
         }
 
-        // goal must NOT have been reached for refunds to be valid
         if campaign.raised >= campaign.goal {
             return Err(CrowdfundError::GoalAlreadyReached.into());
         }
 
-        // verify the vault PDA using the stored bump seed
         let vault_key = Pubkey::create_program_address(
             &[
                 b"vault",
@@ -411,7 +379,6 @@ impl Processor {
             return Err(CrowdfundError::InvalidVaultPda.into());
         }
 
-        // derive and verify the contribution PDA for this donor
         let (contrib_key, _) = Pubkey::find_program_address(
             &[
                 b"contribution",
@@ -424,23 +391,19 @@ impl Processor {
             return Err(CrowdfundError::InvalidContribPda.into());
         }
 
-        // read the donor's contribution record
         let mut record =
             ContributionRecord::try_from_slice(&contribution_pda.try_borrow_data()?)?;
 
-        // verify this record belongs to the caller
         if record.donor != *donor.key {
             return Err(CrowdfundError::NotDonor.into());
         }
 
-        // nothing to refund if the amount is zero
         if record.amount == 0 {
             return Err(CrowdfundError::NothingToRefund.into());
         }
 
         let refund_amount = record.amount;
 
-        // transfer the donor's lamports back from the vault
         invoke_signed(
             &system_instruction::transfer(vault_pda.key, donor.key, refund_amount),
             &[
@@ -455,11 +418,10 @@ impl Processor {
             ]],
         )?;
 
-        // zero out the record so a second refund call fails with NothingToRefund
+        // zero out to prevent a second refund
         record.amount = 0;
         record.serialize(&mut *contribution_pda.try_borrow_mut_data()?)?;
 
-        // reduce the campaign raised total
         campaign.raised = campaign
             .raised
             .checked_sub(refund_amount)

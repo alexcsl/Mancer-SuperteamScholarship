@@ -1,14 +1,10 @@
 use solana_program::program_error::ProgramError;
 
-// all instructions the program accepts
+// byte 0 = discriminant, rest = little-endian payload
 pub enum CrowdfundInstruction {
-    // create a new campaign with a goal and deadline
     CreateCampaign { goal: u64, deadline: i64 },
-    // contribute lamports to a campaign
     Contribute { amount: u64 },
-    // creator withdraws funds after successful campaign
     Withdraw,
-    // donor reclaims funds from a failed campaign
     Refund,
 }
 
