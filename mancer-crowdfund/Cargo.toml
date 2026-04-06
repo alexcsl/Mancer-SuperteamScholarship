@@ -1,0 +1,18 @@
+[package]
+name    = "mancer-crowdfund"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "1.18"
+borsh          = "0.10"
+borsh-derive   = "0.10"
+
+[profile.release]
+overflow-checks = true
+lto             = "thin"
+opt-level       = "z"
+codegen-units   = 1
