@@ -56,6 +56,20 @@ impl Processor {
         if !creator.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
         }
+        // campaign_account must sign as the new account being created
+        if !campaign_account.is_signer {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        if !creator.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !campaign_account.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !vault_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
 
         if system_program_account.key != &system_program::ID {
             return Err(ProgramError::IncorrectProgramId);
@@ -148,6 +162,19 @@ impl Processor {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
+        if !donor.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !campaign_account.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !vault_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !contribution_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+
         if system_program_account.key != &system_program::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
@@ -189,7 +216,8 @@ impl Processor {
 
         let rent = Rent::get()?;
 
-        if contribution_pda.lamports() == 0 {
+        // owner check is griefing-safe; lamports() == 0 is not
+        if contribution_pda.owner != program_id {
             // first contribution from this donor
             invoke_signed(
                 &system_instruction::create_account(
@@ -262,6 +290,16 @@ impl Processor {
             return Err(ProgramError::MissingRequiredSignature);
         }
 
+        if !creator.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !campaign_account.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !vault_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+
         if system_program_account.key != &system_program::ID {
             return Err(ProgramError::IncorrectProgramId);
         }
@@ -302,12 +340,8 @@ impl Processor {
             return Err(CrowdfundError::InvalidVaultPda.into());
         }
 
-        let rent = Rent::get()?;
-        let vault_balance = vault_pda.lamports();
-        let withdraw_amount = vault_balance
-            .checked_sub(rent.minimum_balance(0))
-            .ok_or(ProgramError::InsufficientFunds)?;
-
+        // drain the vault entirely; leaving rent behind permanently locks it
+        let withdraw_amount = vault_pda.lamports();
         if withdraw_amount == 0 {
             return Err(ProgramError::InsufficientFunds);
         }
@@ -345,6 +379,19 @@ impl Processor {
 
         if !donor.is_signer {
             return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        if !donor.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !campaign_account.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !vault_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
+        }
+        if !contribution_pda.is_writable {
+            return Err(ProgramError::InvalidArgument);
         }
 
         if system_program_account.key != &system_program::ID {
@@ -391,8 +438,11 @@ impl Processor {
             return Err(CrowdfundError::InvalidContribPda.into());
         }
 
-        let mut record =
-            ContributionRecord::try_from_slice(&contribution_pda.try_borrow_data()?)?;
+        if contribution_pda.owner != program_id {
+            return Err(CrowdfundError::NothingToRefund.into());
+        }
+
+        let record = ContributionRecord::try_from_slice(&contribution_pda.try_borrow_data()?)?;
 
         if record.donor != *donor.key {
             return Err(CrowdfundError::NotDonor.into());
@@ -418,9 +468,16 @@ impl Processor {
             ]],
         )?;
 
-        // zero out to prevent a second refund
-        record.amount = 0;
-        record.serialize(&mut *contribution_pda.try_borrow_mut_data()?)?;
+        // close contribution_pda: return its rent to the donor
+        let contribution_rent = contribution_pda.lamports();
+        **contribution_pda.try_borrow_mut_lamports()? = 0;
+        **donor.try_borrow_mut_lamports()? = donor
+            .lamports()
+            .checked_add(contribution_rent)
+            .ok_or(CrowdfundError::ArithmeticOverflow)?;
+        for byte in contribution_pda.try_borrow_mut_data()?.iter_mut() {
+            *byte = 0;
+        }
 
         campaign.raised = campaign
             .raised
